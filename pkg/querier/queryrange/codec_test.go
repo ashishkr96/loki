@@ -2893,13 +2893,16 @@ func generateSeries() (res []logproto.SeriesIdentifier) {
 // approx_topk (#23150) is the reported case, but the same failure applies to every
 // internal operator the shard mapper emits. Carrying the plan fixes them all, which this
 // asserts by round-tripping each without depending on the query string being parseable.
-func TestInternalOpDownstreamHTTPGrpcRoundTrip(t *testing.T) {
-	ctx := user.InjectOrgID(context.Background(), "1")
+type internalOpCase struct {
+	name string
+	expr syntax.SampleExpr
+}
 
-	for _, tc := range []struct {
-		name string
-		expr syntax.SampleExpr
-	}{
+// internalOpDownstreamCases returns downstream sub-queries the shard mapper emits with
+// internal operators that are not part of the public LogQL grammar, so their String() form
+// is not parseable. Carrying the plan must restore each one on the querier.
+func internalOpDownstreamCases() []internalOpCase {
+	return []internalOpCase{
 		{
 			// approx_topk sharding -> __count_min_sketch__
 			name: "count_min_sketch",
@@ -2937,25 +2940,33 @@ func TestInternalOpDownstreamHTTPGrpcRoundTrip(t *testing.T) {
 				return e
 			}(),
 		},
-	} {
+	}
+}
+
+func downstreamLokiRequest(expr syntax.SampleExpr) *LokiRequest {
+	return &LokiRequest{
+		Query:     expr.String(),
+		Limit:     100,
+		StartTs:   start,
+		EndTs:     end,
+		Step:      30000,
+		Direction: logproto.FORWARD,
+		Path:      "/loki/api/v1/query_range",
+		Plan:      &plan.QueryPlan{AST: expr},
+	}
+}
+
+func TestInternalOpDownstreamHTTPGrpcRoundTrip(t *testing.T) {
+	ctx := user.InjectOrgID(context.Background(), "1")
+
+	for _, tc := range internalOpDownstreamCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			// Sanity: the serialized form really is unparseable, so a querier that
 			// re-parses the query string (rather than using the plan) would 400.
 			_, err := syntax.ParseExpr(tc.expr.String())
 			require.Errorf(t, err, "internal operator string unexpectedly parseable: %s", tc.expr.String())
 
-			req := &LokiRequest{
-				Query:     tc.expr.String(),
-				Limit:     100,
-				StartTs:   start,
-				EndTs:     end,
-				Step:      30000,
-				Direction: logproto.FORWARD,
-				Path:      "/loki/api/v1/query_range",
-				Plan:      &plan.QueryPlan{AST: tc.expr},
-			}
-
-			httpReq, err := DefaultCodec.EncodeRequest(ctx, req)
+			httpReq, err := DefaultCodec.EncodeRequest(ctx, downstreamLokiRequest(tc.expr))
 			require.NoError(t, err)
 
 			// The plan travels in the request body, not the URL, so large plans cannot
@@ -2968,6 +2979,29 @@ func TestInternalOpDownstreamHTTPGrpcRoundTrip(t *testing.T) {
 
 			got, _, err := DefaultCodec.DecodeHTTPGrpcRequest(ctx, grpcReq)
 			require.NoError(t, err, "querier must decode the downstream sub-query via the plan, without re-parsing the query string")
+
+			lokiReq, ok := got.(*LokiRequest)
+			require.True(t, ok)
+			require.NotNil(t, lokiReq.Plan)
+			require.NotNil(t, lokiReq.Plan.AST)
+			require.Equal(t, tc.expr.String(), lokiReq.Plan.AST.String())
+		})
+	}
+}
+
+// TestInternalOpDownstreamHTTPRoundTrip is the plain-HTTP DecodeRequest counterpart of
+// TestInternalOpDownstreamHTTPGrpcRoundTrip: both decode paths share parseRangeQuery, so
+// both must restore the plan AST rather than re-parsing the internal-operator string.
+func TestInternalOpDownstreamHTTPRoundTrip(t *testing.T) {
+	ctx := user.InjectOrgID(context.Background(), "1")
+
+	for _, tc := range internalOpDownstreamCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			httpReq, err := DefaultCodec.EncodeRequest(ctx, downstreamLokiRequest(tc.expr))
+			require.NoError(t, err)
+
+			got, err := DefaultCodec.DecodeRequest(ctx, httpReq, nil)
+			require.NoError(t, err, "querier must decode the downstream sub-query via the plan on the HTTP transport too")
 
 			lokiReq, ok := got.(*LokiRequest)
 			require.True(t, ok)

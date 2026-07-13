@@ -777,9 +777,6 @@ func (c Codec) EncodeRequest(ctx context.Context, r queryrangebase.Request) (*ht
 			}
 			params["storeChunks"] = []string{string(b)}
 		}
-		if err := encodeQueryPlan(params, request.Plan); err != nil {
-			return nil, err
-		}
 		u := &url.URL{
 			// the request could come /api/prom/query but we want to only use the new api.
 			Path:     "/loki/api/v1/query_range",
@@ -791,6 +788,9 @@ func (c Codec) EncodeRequest(ctx context.Context, r queryrangebase.Request) (*ht
 			URL:        u,
 			Body:       http.NoBody,
 			Header:     header,
+		}
+		if err := setQueryPlanBody(req, request.Plan); err != nil {
+			return nil, err
 		}
 
 		return req.WithContext(ctx), nil
@@ -844,9 +844,6 @@ func (c Codec) EncodeRequest(ctx context.Context, r queryrangebase.Request) (*ht
 		if len(request.Shards) > 0 {
 			params["shards"] = request.Shards
 		}
-		if err := encodeQueryPlan(params, request.Plan); err != nil {
-			return nil, err
-		}
 		u := &url.URL{
 			// the request could come /api/prom/query but we want to only use the new api.
 			Path:     "/loki/api/v1/query",
@@ -858,6 +855,9 @@ func (c Codec) EncodeRequest(ctx context.Context, r queryrangebase.Request) (*ht
 			URL:        u,
 			Body:       http.NoBody,
 			Header:     header,
+		}
+		if err := setQueryPlanBody(req, request.Plan); err != nil {
+			return nil, err
 		}
 
 		return req.WithContext(ctx), nil
@@ -2274,10 +2274,15 @@ func mergeLokiResponse(responses ...queryrangebase.Response) *LokiResponse {
 // query-frontend and the querier. Downstream sub-queries produced by the shard mapper can
 // contain internal operators (e.g. __count_min_sketch__) that are not part of the public
 // LogQL grammar, so the querier must restore the AST from the plan rather than re-parsing
-// the query string.
+// the query string. It is sent in the request body (see setQueryPlanBody) so large plans
+// do not bloat the URL.
 const planParam = "plan"
 
-func encodeQueryPlan(params url.Values, p *plan.QueryPlan) error {
+// setQueryPlanBody moves the serialized query plan into the request body as a POST form,
+// rather than the URL, so a large plan cannot exceed URL-length limits on the httpgrpc hop.
+// The querier's ParseForm merges it back into r.Form, where decodeQueryPlan reads it. No-op
+// when the request carries no plan, leaving it a plain GET.
+func setQueryPlanBody(req *http.Request, p *plan.QueryPlan) error {
 	if p == nil || p.AST == nil {
 		return nil
 	}
@@ -2285,7 +2290,11 @@ func encodeQueryPlan(params url.Values, p *plan.QueryPlan) error {
 	if err != nil {
 		return errors.Wrap(err, "marshaling query plan")
 	}
-	params[planParam] = []string{base64.StdEncoding.EncodeToString(b)}
+	body := url.Values{planParam: []string{base64.StdEncoding.EncodeToString(b)}}.Encode()
+	req.Method = http.MethodPost
+	req.Body = io.NopCloser(strings.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return nil
 }
 

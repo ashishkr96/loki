@@ -2958,6 +2958,11 @@ func TestInternalOpDownstreamHTTPGrpcRoundTrip(t *testing.T) {
 			httpReq, err := DefaultCodec.EncodeRequest(ctx, req)
 			require.NoError(t, err)
 
+			// The plan travels in the request body, not the URL, so large plans cannot
+			// exceed URL-length limits on the httpgrpc hop.
+			require.Equal(t, http.MethodPost, httpReq.Method)
+			require.NotContains(t, httpReq.URL.RawQuery, planParam+"=", "plan must not be in the URL")
+
 			grpcReq, err := httpgrpc.FromHTTPRequest(httpReq)
 			require.NoError(t, err)
 

@@ -2877,3 +2877,36 @@ func generateSeries() (res []logproto.SeriesIdentifier) {
 	}
 	return res
 }
+
+// TestNewEmptyResponseInternalOp ensures NewEmptyResponse uses req.Plan.AST instead of
+// re-parsing req.Query, which fails for internal operators like __count_min_sketch__
+// (reachable via the max_query_lookback clamp in limits.go). Regression for #23150.
+func TestNewEmptyResponseInternalOp(t *testing.T) {
+	// Build a downstream __count_min_sketch__ expression the way the shard mapper does.
+	countMinSketch := syntax.MustClone(
+		syntax.MustParseExpr(`approx_topk(3, sum by (ip)(rate({foo="bar"}[5m])))`).(*syntax.VectorAggregationExpr),
+	)
+	countMinSketch.Operation = syntax.OpTypeCountMinSketch
+	countMinSketch.Params = 0
+
+	// Sanity: its serialized form is genuinely unparseable.
+	_, err := syntax.ParseExpr(countMinSketch.String())
+	require.Error(t, err)
+
+	req := &LokiRequest{
+		Query:     countMinSketch.String(),
+		Limit:     100,
+		StartTs:   start,
+		EndTs:     end,
+		Step:      30000,
+		Direction: logproto.FORWARD,
+		Path:      "/loki/api/v1/query_range",
+		Plan:      &plan.QueryPlan{AST: countMinSketch},
+	}
+
+	resp, err := NewEmptyResponse(req)
+	require.NoError(t, err)
+	// __count_min_sketch__ is a sample expr, so the empty response must be a matrix.
+	_, ok := resp.(*LokiPromResponse)
+	require.True(t, ok, "expected a metric (matrix) empty response for an internal sample operator")
+}

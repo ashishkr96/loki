@@ -2182,10 +2182,18 @@ func NewEmptyResponse(r queryrangebase.Request) (queryrangebase.Response, error)
 			},
 		}, nil
 	case *LokiRequest:
-		// range query can either be metrics or logs
-		expr, err := syntax.ParseExpr(req.Query)
-		if err != nil {
-			return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
+		// Prefer the AST on the plan: downstream sub-queries can use internal operators
+		// (e.g. __count_min_sketch__) that are not in the public grammar, so re-parsing
+		// req.Query would fail. Fall back to parsing only when no plan is present.
+		var expr syntax.Expr
+		if req.Plan != nil && req.Plan.AST != nil {
+			expr = req.Plan.AST
+		} else {
+			var err error
+			expr, err = syntax.ParseExpr(req.Query)
+			if err != nil {
+				return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
+			}
 		}
 		if _, ok := expr.(syntax.SampleExpr); ok {
 			return &LokiPromResponse{
